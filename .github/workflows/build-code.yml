@@ -1,0 +1,32 @@
+name: Build Code
+
+on:
+  workflow_dispatch:
+
+jobs:
+  arrange:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack project (make_repo.sh)
+        run: |
+          chmod +x make_repo.sh
+          ./make_repo.sh
+
+      - name: Commit & push full tree
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "Nothing new to commit."
+          else
+            git commit -m "chore: unpack full GhoSty Commercial project"
+            git push
+            echo "Full project pushed."
+          fi

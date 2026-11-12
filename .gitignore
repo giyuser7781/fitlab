@@ -1,0 +1,14 @@
+.env
+*.token
+tokens.txt
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+.idea/
+.vscode/
+.DS_Store
+*.log
+ghostyhbworkers.json
+ghostyworkerquests.json

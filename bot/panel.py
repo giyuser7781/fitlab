@@ -300,8 +300,3 @@ def setup_panel(bot: commands.Bot):
             content = f"**GhoSty Farm Panel** — owner <@{owner_id}>\nStatus: **Idle** · Click **Add Token** to start"
 
         await ctx.send(content, view=view)
-
-    # Persist views across restarts (buttons stay clickable)
-    bot.add_view(FreshPanelView(0))  # placeholder, real ones use owner_id
-    # Note: for production with persistent views you would store owner_id in custom_id
-    # and re-register on startup. For this test model (in-memory wipe on restart) it is fine.

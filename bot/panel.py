@@ -60,43 +60,23 @@ class TokenModal(ui.Modal):
             await inter.followup.send("Invalid discord token. Try again.", ephemeral=True)
             return
 
-        # Real validation: try to login as selfbot briefly to get user
-        from selfbot.worker import create_selfbot
-        import discord as dpy
+        # Validate via REST only (no gateway login — avoids session conflict)
+        from selfbot.worker import validate_token
 
-        test_bot = create_selfbot()
-        token_user = None
-        try:
-            await test_bot.login(token)
-            token_user = test_bot.user
-            await test_bot.close()
-        except dpy.LoginFailure:
-            await inter.followup.send("Invalid discord token. Try again.", ephemeral=True)
-            try:
-                await test_bot.close()
-            except Exception:
-                pass
-            return
-        except Exception as e:
-            await inter.followup.send(
-                f"Token validation failed: {e}", ephemeral=True
-            )
-            try:
-                await test_bot.close()
-            except Exception:
-                pass
-            return
-
-        if token_user is None:
+        user_data = await validate_token(token)
+        if not user_data:
             await inter.followup.send("Invalid discord token. Try again.", ephemeral=True)
             return
+
+        token_user_id = int(user_data["id"])
+        token_username = user_data.get("username", "Unknown")
 
         guild = inter.guild
         # Check token account is in this server
-        token_member = guild.get_member(token_user.id)
+        token_member = guild.get_member(token_user_id)
         if token_member is None:
             try:
-                token_member = await guild.fetch_member(token_user.id)
+                token_member = await guild.fetch_member(token_user_id)
             except Exception:
                 token_member = None
 
@@ -140,7 +120,7 @@ class TokenModal(ui.Modal):
 
         SESSIONS[self.owner_id] = {
             "token": token,
-            "token_user_id": token_user.id,
+            "token_user_id": token_user_id,
             "channel_id": channel.id,
             "channel": channel,
             "ws": None,
@@ -167,7 +147,7 @@ class TokenModal(ui.Modal):
             return
 
         await inter.followup.send(
-            f"Session started.\nFarm channel: {channel.mention}\nAccount: **{token_user}**",
+            f"Session started.\nFarm channel: {channel.mention}\nAccount: **{token_username}**",
             ephemeral=True,
         )
 
@@ -176,7 +156,7 @@ class TokenModal(ui.Modal):
             if inter.message:
                 view = ManagedPanelView(self.owner_id)
                 await inter.message.edit(
-                    content=f"**GhoSty Farm Panel** — owner <@{self.owner_id}>\nStatus: **Active** · Account: `{token_user}` · Channel: {channel.mention}",
+                    content=f"**GhoSty Farm Panel** — owner <@{self.owner_id}>\nStatus: **Active** · Account: `{token_username}` · Channel: {channel.mention}",
                     view=view,
                 )
         except Exception:

@@ -2,6 +2,7 @@
 Private channel creation / deletion / permission overwrites.
 """
 
+import asyncio
 import disnake
 from disnake import PermissionOverwrite
 
@@ -57,9 +58,7 @@ async def create_private_farm_channel(
 async def delete_farm_channel(channel: disnake.TextChannel, delay: float = 5.0):
     """Delete channel after optional delay (loading buffer)."""
     if delay > 0:
-        await disnake.utils.sleep_until(
-            disnake.utils.utcnow() + disnake.utils.timedelta(seconds=delay)
-        )
+        await asyncio.sleep(delay)
     try:
         await channel.delete(reason="GhoSty farm session ended")
     except Exception:

@@ -1,6 +1,6 @@
 """
-Selfbot worker launcher.
-One instance per commercial session.
+Selfbot worker launcher — multi-worker, reconnect-aware.
+One instance per commercial session. Same lifetime farming pattern as original Ghosty.
 """
 
 import asyncio
@@ -18,10 +18,7 @@ def create_selfbot():
 
 
 async def validate_token(token: str):
-    """
-    Validate user token via REST only (no gateway login).
-    Returns user dict or None.
-    """
+    """Validate user token via REST only (no gateway login)."""
     headers = {
         "Authorization": token.strip(),
         "Content-Type": "application/json",
@@ -44,12 +41,15 @@ async def validate_token(token: str):
 
 async def start_worker(token: str, channel_id: int, owner_id: int, worker_id: int, session_store: dict):
     """
-    Start a single selfbot worker, farm in the given channel, auto-start.
-    Returns the WorkerState or None on failure.
+    Start a single selfbot worker. Auto-start farming.
+    Gateway disconnect → wait for resume; do not spam closed-session errors.
     """
     bot = create_selfbot()
     ws = WorkerState(worker_id, owner_id, channel_id)
     ws.bot = bot
+    ws.gateway_down = False
+    ws.resume_event = asyncio.Event()
+    ws.resume_event.set()  # start as "up"
 
     ready_event = asyncio.Event()
 
@@ -57,16 +57,22 @@ async def start_worker(token: str, channel_id: int, owner_id: int, worker_id: in
     async def on_ready():
         ws.username = str(bot.user)
         log_worker_event(worker_id, f"Connected as {bot.user}", "SUCCESS")
+        ws.gateway_down = False
+        ws.resume_event.set()
         if not ready_event.is_set():
             ready_event.set()
 
     @bot.event
     async def on_disconnect():
         log_worker_event(worker_id, "Disconnected", "WARN")
+        ws.gateway_down = True
+        ws.resume_event.clear()
 
     @bot.event
     async def on_resumed():
         log_worker_event(worker_id, "Resumed gateway", "INFO")
+        ws.gateway_down = False
+        ws.resume_event.set()
 
     try:
         bot_task = asyncio.create_task(bot.start(token))
@@ -82,7 +88,6 @@ async def start_worker(token: str, channel_id: int, owner_id: int, worker_id: in
                 pass
             return None
 
-        # Small settle delay so session is fully open
         await asyncio.sleep(2)
 
         channel = bot.get_channel(channel_id)
@@ -118,6 +123,8 @@ async def stop_worker(session: dict):
     if ws:
         ws.running = False
         ws.halted = True
+        if hasattr(ws, "resume_event") and ws.resume_event is not None:
+            ws.resume_event.set()
     farm_task = session.get("farm_task")
     if farm_task and not farm_task.done():
         farm_task.cancel()

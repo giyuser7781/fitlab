@@ -91,7 +91,7 @@ class TokenModal(ui.Modal):
         global WORKER_COUNTER
 
         if self.is_update and self.owner_id in SESSIONS:
-            # Stop old session, delete old channel
+            # Stop old session, delete old channel (if still exists)
             old = SESSIONS[self.owner_id]
             await inter.followup.send(
                 "Stopping previous session and switching token...", ephemeral=True
@@ -99,7 +99,10 @@ class TokenModal(ui.Modal):
             await stop_worker(old)
             old_channel = old.get("channel")
             if old_channel:
-                await delete_farm_channel(old_channel, delay=5.0)
+                try:
+                    await delete_farm_channel(old_channel, delay=2.0)
+                except Exception:
+                    pass
             SESSIONS.pop(self.owner_id, None)
 
         # Create private channel
@@ -219,18 +222,19 @@ class RemoveTokenButton(ui.Button):
             return
 
         session = SESSIONS.get(self.owner_id)
-        if not session:
-            await inter.response.send_message("No active session.", ephemeral=True)
-            return
-
         await inter.response.defer(ephemeral=True)
-        await stop_worker(session)
-        channel = session.get("channel")
-        if channel:
-            await delete_farm_channel(channel, delay=2.0)
-        SESSIONS.pop(self.owner_id, None)
 
-        # Reset panel to fresh state
+        if session:
+            await stop_worker(session)
+            channel = session.get("channel")
+            if channel:
+                try:
+                    await delete_farm_channel(channel, delay=2.0)
+                except Exception:
+                    pass
+            SESSIONS.pop(self.owner_id, None)
+
+        # Always reset panel to fresh state
         try:
             view = FreshPanelView(self.owner_id)
             await inter.message.edit(
@@ -240,7 +244,7 @@ class RemoveTokenButton(ui.Button):
         except Exception:
             pass
 
-        await inter.followup.send("Session removed. Channel deleted.", ephemeral=True)
+        await inter.followup.send("Session removed.", ephemeral=True)
 
 
 class FreshPanelView(ui.View):
@@ -266,15 +270,46 @@ def setup_panel(bot: commands.Bot):
             return  # silent ignore
 
         owner_id = ctx.author.id
-        has_session = owner_id in SESSIONS and SESSIONS[owner_id].get("ws") is not None
+        session = SESSIONS.get(owner_id)
+        has_session = False
+
+        if session and session.get("ws") is not None:
+            # Verify the farm channel still exists (user may have deleted it manually)
+            ch = session.get("channel")
+            ch_id = session.get("channel_id")
+            still_alive = False
+            if ch is not None:
+                try:
+                    # Try to fetch — if deleted, this fails
+                    fetched = ctx.guild.get_channel(ch.id) or await ctx.guild.fetch_channel(ch.id)
+                    still_alive = fetched is not None
+                except Exception:
+                    still_alive = False
+            elif ch_id:
+                try:
+                    fetched = ctx.guild.get_channel(ch_id) or await ctx.guild.fetch_channel(ch_id)
+                    still_alive = fetched is not None
+                except Exception:
+                    still_alive = False
+
+            if still_alive:
+                has_session = True
+            else:
+                # Channel gone — clean stale session so panel goes back to Add Token
+                from selfbot.worker import stop_worker
+                try:
+                    await stop_worker(session)
+                except Exception:
+                    pass
+                SESSIONS.pop(owner_id, None)
+                has_session = False
 
         if has_session:
             view = ManagedPanelView(owner_id)
-            status = "Active"
             session = SESSIONS[owner_id]
             ch = session.get("channel")
             mention = ch.mention if ch else "unknown"
-            content = f"**GhoSty Farm Panel** — owner <@{owner_id}>\nStatus: **{status}** · Channel: {mention}"
+            content = f"**GhoSty Farm Panel** — owner <@{owner_id}>\nStatus: **Active** · Channel: {mention}"
         else:
             view = FreshPanelView(owner_id)
             content = f"**GhoSty Farm Panel** — owner <@{owner_id}>\nStatus: **Idle** · Click **Add Token** to start"

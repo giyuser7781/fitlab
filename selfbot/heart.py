@@ -1,13 +1,14 @@
 """
-Solo farming heart - lifetime mode only.
+Solo farming heart — lifetime mode, reconnect-aware.
 Huntbot + gem + mail + warning detection + auto-halt.
+Command pattern aligned with original Ghosty solo worker.
 """
 
 import random as ghostyjija
 import re
 import asyncio as made_by_ghosty
 from datetime import datetime, timedelta
-from .modules import SPEED_MODES, parse_gems, format_value
+from .modules import SPEED_MODES, parse_gems
 from .ghostycorehb import GhoStySolveNormalCap, GhoStySyncedCaptchaSolve
 from .ui import log_worker_event
 from .mailmodule import execute_mail_claim
@@ -44,6 +45,9 @@ class WorkerState:
         self.last_mail_claim = None
         self.warning_count = 0
         self.halted = False
+        self.gateway_down = False
+        self.resume_event = None
+        self.dead_since = None
 
 
 class PseudoCtx:
@@ -77,8 +81,74 @@ async def GhoStyCapUrlSolver(url):
     return None
 
 
+async def _wait_for_gateway(ws, timeout: float = 180.0) -> bool:
+    """Wait for gateway resume if down. True = ok to send."""
+    bot = ws.bot
+    if bot is None:
+        return False
+    if not getattr(ws, "gateway_down", False) and not bot.is_closed():
+        return True
+
+    log_worker_event(ws.worker_number, "Gateway down — waiting for resume...", "WARN")
+    ws.dead_since = datetime.now()
+    event = getattr(ws, "resume_event", None)
+
+    if event is None:
+        end = datetime.now() + timedelta(seconds=timeout)
+        while datetime.now() < end and ws.running and not ws.halted:
+            if not bot.is_closed() and not getattr(ws, "gateway_down", False):
+                ws.gateway_down = False
+                ws.dead_since = None
+                log_worker_event(ws.worker_number, "Gateway back", "INFO")
+                return True
+            await made_by_ghosty.sleep(3)
+        log_worker_event(ws.worker_number, f"No resume after {int(timeout)}s — stopping", "FATAL")
+        ws.halted = True
+        ws.running = False
+        return False
+
+    try:
+        await made_by_ghosty.wait_for(event.wait(), timeout=timeout)
+        await made_by_ghosty.sleep(1.5)
+        if not bot.is_closed():
+            ws.gateway_down = False
+            ws.dead_since = None
+            log_worker_event(ws.worker_number, "Gateway resumed — continuing", "INFO")
+            return True
+    except made_by_ghosty.TimeoutError:
+        log_worker_event(ws.worker_number, f"No resume after {int(timeout)}s — stopping", "FATAL")
+        ws.halted = True
+        ws.running = False
+        return False
+    except Exception as e:
+        log_worker_event(ws.worker_number, f"Resume wait error: {e}", "WARNING")
+        return False
+    return False
+
+
+async def _safe_send(ctx, ws, content: str) -> bool:
+    """Send only when gateway is up."""
+    if not await _wait_for_gateway(ws):
+        return False
+    try:
+        await ctx.send(content)
+        return True
+    except Exception as e:
+        err = str(e).lower()
+        if "session is closed" in err or "cannot send" in err or "closed" in err:
+            ws.gateway_down = True
+            if getattr(ws, "resume_event", None) is not None:
+                ws.resume_event.clear()
+            log_worker_event(ws.worker_number, "Send failed (session closed) — will wait", "WARN")
+            return False
+        log_worker_event(ws.worker_number, f"Send error: {e}", "WARNING")
+        return False
+
+
 async def CheckGhoStyHbMsgFetch(ctx, ws, cowoncy_amount=None):
     if not ws.huntbot_enabled or ws.halted:
+        return False
+    if not await _wait_for_gateway(ws):
         return False
     try:
         await made_by_ghosty.sleep(1)
@@ -107,7 +177,8 @@ async def CheckGhoStyHbMsgFetch(ctx, ws, cowoncy_amount=None):
                     pass
                 log_worker_event(ws.worker_number, f"HuntBot optimal: {optimal}", "INFO")
                 await made_by_ghosty.sleep(2)
-                await ctx.send(f"owo hb {optimal}")
+                if not await _safe_send(ctx, ws, f"owo hb {optimal}"):
+                    return False
                 await made_by_ghosty.sleep(4)
                 return await CheckGhoStyHbMsgFetch(ctx, ws, optimal)
 
@@ -116,29 +187,23 @@ async def CheckGhoStyHbMsgFetch(ctx, ws, cowoncy_amount=None):
                 if match:
                     delta = ParseGhoStyTimeStrs(match.group(1).strip())
                     ws.GhoStyHbAlrActiveVar = True
-                    log_worker_event(
-                        ws.worker_number, f"Next huntbot in {delta}", "INFO"
-                    )
+                    log_worker_event(ws.worker_number, f"Next huntbot in {delta}", "INFO")
                     return True
 
             if "here is your password!" in msg_content_lower and msg.attachments:
                 url = msg.attachments[0].url
-                log_worker_event(ws.worker_number, f"Solving captcha...", "DEBUG")
+                log_worker_event(ws.worker_number, "Solving captcha...", "DEBUG")
                 result = await GhoStyCapUrlSolver(url)
                 if result:
                     use_cowoncy = cowoncy_amount or 20000
                     await made_by_ghosty.sleep(2)
-                    await ctx.send(f"owo autohunt {use_cowoncy} {result}")
-                    log_worker_event(
-                        ws.worker_number, f"Auto-solved HuntBot: {result}", "SUCCESS"
-                    )
+                    if not await _safe_send(ctx, ws, f"owo autohunt {use_cowoncy} {result}"):
+                        return False
+                    log_worker_event(ws.worker_number, f"Auto-solved HuntBot: {result}", "SUCCESS")
                     await made_by_ghosty.sleep(4)
                     return await CheckGhoStyHbMsgFetch(ctx, ws, use_cowoncy)
-                else:
-                    log_worker_event(
-                        ws.worker_number, "Captcha solver failed", "WARNING"
-                    )
-                    return False
+                log_worker_event(ws.worker_number, "Captcha solver failed", "WARNING")
+                return False
 
             if (
                 "you spent" in msg_content_lower
@@ -155,11 +220,17 @@ async def CheckGhoStyHbMsgFetch(ctx, ws, cowoncy_amount=None):
             if "i am back with" in msg_content_lower and "animals" in msg_content_lower:
                 log_worker_event(ws.worker_number, "Hunt completed!", "SUCCESS")
                 await made_by_ghosty.sleep(15)
-                await ctx.send("owo hb")
+                if not await _safe_send(ctx, ws, "owo hb"):
+                    return False
                 await made_by_ghosty.sleep(4)
                 return await CheckGhoStyHbMsgFetch(ctx, ws)
         return False
     except Exception as e:
+        err = str(e).lower()
+        if "session is closed" in err or "closed" in err:
+            ws.gateway_down = True
+            if getattr(ws, "resume_event", None) is not None:
+                ws.resume_event.clear()
         log_worker_event(ws.worker_number, f"HB error: {e}", "WARNING")
         return False
 
@@ -167,22 +238,24 @@ async def CheckGhoStyHbMsgFetch(ctx, ws, cowoncy_amount=None):
 async def _do_gem_check(ctx, ws):
     if ws.sleep_mode or ws.paused or ws.halted:
         return
-    await ctx.send("owo lb all")
+    if not await _safe_send(ctx, ws, "owo lb all"):
+        return
     await made_by_ghosty.sleep(2)
-    await ctx.send("owo inventory")
+    if not await _safe_send(ctx, ws, "owo inventory"):
+        return
     await made_by_ghosty.sleep(3)
     try:
+        if ws.bot and ws.bot.is_closed():
+            return
         latest = [msg async for msg in ctx.channel.history(limit=3)]
         for message in latest:
             if message.author.id == 408785106942164992 and "inventory" in message.content.lower():
                 gem_numbers = await parse_gems(message.content)
                 if gem_numbers:
                     gems_str = " ".join(gem_numbers)
-                    await ctx.send(f"owo use {gems_str}")
-                    ws.ghosty_gems_used += len(gem_numbers)
-                    log_worker_event(
-                        ws.worker_number, f"Used gems: {gems_str}", "SUCCESS"
-                    )
+                    if await _safe_send(ctx, ws, f"owo use {gems_str}"):
+                        ws.ghosty_gems_used += len(gem_numbers)
+                        log_worker_event(ws.worker_number, f"Used gems: {gems_str}", "SUCCESS")
                 break
     except Exception as e:
         log_worker_event(ws.worker_number, f"Gem check error: {e}", "WARNING")
@@ -190,7 +263,7 @@ async def _do_gem_check(ctx, ws):
 
 
 async def _run_farming_loop(ctx, ws, bot):
-    """Main solo farming loop - lifetime mode, auto-start."""
+    """Main farming loop — lifetime, reconnect-aware, Ghosty-like command pattern."""
     mode = SPEED_MODES["lifetime"]
     ws.running = True
     ws.has_started = True
@@ -198,9 +271,8 @@ async def _run_farming_loop(ctx, ws, bot):
     ws.lifetime_cycle_start_time = datetime.now()
     log_worker_event(ws.worker_number, "Farming started (lifetime mode)", "SUCCESS")
 
-    # Initial huntbot kick
     if ws.huntbot_enabled:
-        await ctx.send("owo hb")
+        await _safe_send(ctx, ws, "owo hb")
         await made_by_ghosty.sleep(3)
         await CheckGhoStyHbMsgFetch(ctx, ws)
 
@@ -212,9 +284,13 @@ async def _run_farming_loop(ctx, ws, bot):
     )
     next_mail = datetime.now() + timedelta(minutes=ghostyjija.randint(30, 90))
     commands = ["owo h", "owo b", "owo hunt", "owo battle"]
+    consecutive_send_fails = 0
 
     while ws.running and not ws.halted:
         try:
+            if not await _wait_for_gateway(ws, timeout=180.0):
+                break
+
             if ws.paused:
                 if ws.pause_end_time and datetime.now() >= ws.pause_end_time:
                     ws.paused = False
@@ -241,49 +317,47 @@ async def _run_farming_loop(ctx, ws, bot):
                     await made_by_ghosty.sleep(10)
                     continue
 
-            # Lifetime work window expired -> sleep
             if datetime.now() >= work_end and not ws.sleep_mode:
                 ws.sleep_mode = True
                 ws.sleep_start_time = datetime.now()
                 log_worker_event(ws.worker_number, "Entering sleep (lifetime cycle)", "INFO")
                 continue
 
-            # Warning detection (OwO bot messages)
             try:
-                recent = [m async for m in ctx.channel.history(limit=8)]
-                for m in recent:
-                    if m.author.id == 408785106942164992:
-                        content = (m.content or "").lower()
-                        if any(
-                            w in content
-                            for w in [
-                                "you have been banned",
-                                "you are banned",
-                                "warning",
-                                "please stop",
-                                "slow down",
-                                "you have been timed out",
-                            ]
-                        ):
-                            ws.warning_count += 1
-                            log_worker_event(
-                                ws.worker_number,
-                                f"OwO warning detected ({ws.warning_count})",
-                                "CRITICAL",
-                            )
-                            if ws.warning_count >= 1:
-                                ws.halted = True
-                                ws.running = False
+                if not bot.is_closed():
+                    recent = [m async for m in ctx.channel.history(limit=8)]
+                    for m in recent:
+                        if m.author.id == 408785106942164992:
+                            content = (m.content or "").lower()
+                            if any(
+                                w in content
+                                for w in [
+                                    "you have been banned",
+                                    "you are banned",
+                                    "warning",
+                                    "please stop",
+                                    "slow down",
+                                    "you have been timed out",
+                                ]
+                            ):
+                                ws.warning_count += 1
                                 log_worker_event(
                                     ws.worker_number,
-                                    "Auto-halt after warning (ban prevention)",
-                                    "FATAL",
+                                    f"OwO warning detected ({ws.warning_count})",
+                                    "CRITICAL",
                                 )
-                                return
+                                if ws.warning_count >= 1:
+                                    ws.halted = True
+                                    ws.running = False
+                                    log_worker_event(
+                                        ws.worker_number,
+                                        "Auto-halt after warning (ban prevention)",
+                                        "FATAL",
+                                    )
+                                    return
             except Exception:
                 pass
 
-            # Gem check
             if datetime.now() >= next_gem:
                 await _do_gem_check(ctx, ws)
                 next_gem = datetime.now() + timedelta(
@@ -292,20 +366,31 @@ async def _run_farming_loop(ctx, ws, bot):
                     )
                 )
 
-            # Mail claim
             if datetime.now() >= next_mail and not ws.is_mail_claiming:
-                ws.is_mail_claiming = True
-                await execute_mail_claim(ctx, ws, bot)
-                next_mail = datetime.now() + timedelta(minutes=ghostyjija.randint(45, 120))
+                if await _wait_for_gateway(ws):
+                    ws.is_mail_claiming = True
+                    try:
+                        await execute_mail_claim(ctx, ws, bot)
+                    except Exception as e:
+                        log_worker_event(ws.worker_number, f"Mail error: {e}", "WARNING")
+                    finally:
+                        ws.is_mail_claiming = False
+                    next_mail = datetime.now() + timedelta(minutes=ghostyjija.randint(45, 120))
 
-            # Huntbot check occasionally
             if ws.huntbot_enabled and ghostyjija.random() < 0.08:
                 await CheckGhoStyHbMsgFetch(ctx, ws)
 
-            # Main command
             cmd = ghostyjija.choice(commands)
-            await ctx.send(cmd)
-            ws.ghosty_commands_sent += 1
+            ok = await _safe_send(ctx, ws, cmd)
+            if ok:
+                ws.ghosty_commands_sent += 1
+                consecutive_send_fails = 0
+            else:
+                consecutive_send_fails += 1
+                if consecutive_send_fails >= 5:
+                    consecutive_send_fails = 0
+                    await made_by_ghosty.sleep(5)
+                    continue
 
             delay = ghostyjija.uniform(mode["action_delay_min"], mode["action_delay_max"])
             if ghostyjija.random() < 0.12:
@@ -314,8 +399,17 @@ async def _run_farming_loop(ctx, ws, bot):
                 )
             await made_by_ghosty.sleep(delay)
 
+        except made_by_ghosty.CancelledError:
+            break
         except Exception as e:
-            log_worker_event(ws.worker_number, f"Loop error: {e}", "WARNING")
-            await made_by_ghosty.sleep(10)
+            err = str(e).lower()
+            if "session is closed" in err or "cannot send" in err:
+                ws.gateway_down = True
+                if getattr(ws, "resume_event", None) is not None:
+                    ws.resume_event.clear()
+                await made_by_ghosty.sleep(3)
+            else:
+                log_worker_event(ws.worker_number, f"Loop error: {e}", "WARNING")
+                await made_by_ghosty.sleep(10)
 
     log_worker_event(ws.worker_number, "Farming loop ended", "INFO")

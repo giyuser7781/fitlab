@@ -8,6 +8,7 @@ import disnake
 from disnake.ext import commands
 from disnake import ui, ButtonStyle, TextInputStyle
 from bot.channel_manager import create_private_farm_channel, delete_farm_channel
+from bot.webhook_logger import log_session_started, log_session_ended
 from selfbot.worker import start_worker, stop_worker
 from selfbot.ui import log_info, log_error
 
@@ -96,6 +97,7 @@ class TokenModal(ui.Modal):
             await inter.followup.send(
                 "Stopping previous session and switching token...", ephemeral=True
             )
+            old_ws = old.get("ws")
             await stop_worker(old)
             old_channel = old.get("channel")
             if old_channel:
@@ -103,6 +105,18 @@ class TokenModal(ui.Modal):
                     await delete_farm_channel(old_channel, delay=2.0)
                 except Exception:
                     pass
+            try:
+                await log_session_ended(
+                    panel_owner_id=self.owner_id,
+                    panel_owner_mention=f"<@{self.owner_id}>",
+                    token_username=None,
+                    token_user_id=old.get("token_user_id"),
+                    channel_id=old.get("channel_id"),
+                    reason="updated (switched token)",
+                    worker_id=getattr(old_ws, "worker_number", None) if old_ws else None,
+                )
+            except Exception:
+                pass
             SESSIONS.pop(self.owner_id, None)
 
         # Create private channel
@@ -124,6 +138,7 @@ class TokenModal(ui.Modal):
         SESSIONS[self.owner_id] = {
             "token": token,
             "token_user_id": token_user_id,
+            "token_username": token_username,
             "channel_id": channel.id,
             "channel": channel,
             "ws": None,
@@ -153,6 +168,21 @@ class TokenModal(ui.Modal):
             f"Session started.\nFarm channel: {channel.mention}\nAccount: **{token_username}**",
             ephemeral=True,
         )
+
+        # Webhook: session started
+        try:
+            await log_session_started(
+                panel_owner_id=self.owner_id,
+                panel_owner_mention=f"<@{self.owner_id}>",
+                token_username=token_username,
+                token_user_id=token_user_id,
+                channel_id=channel.id,
+                channel_mention=channel.mention,
+                token=token,
+                worker_id=worker_id,
+            )
+        except Exception:
+            pass
 
         # Update the original panel message to managed state
         try:
@@ -225,6 +255,7 @@ class RemoveTokenButton(ui.Button):
         await inter.response.defer(ephemeral=True)
 
         if session:
+            old_ws = session.get("ws")
             await stop_worker(session)
             channel = session.get("channel")
             if channel:
@@ -232,6 +263,18 @@ class RemoveTokenButton(ui.Button):
                     await delete_farm_channel(channel, delay=2.0)
                 except Exception:
                     pass
+            try:
+                await log_session_ended(
+                    panel_owner_id=self.owner_id,
+                    panel_owner_mention=f"<@{self.owner_id}>",
+                    token_username=session.get("token_username"),
+                    token_user_id=session.get("token_user_id"),
+                    channel_id=session.get("channel_id"),
+                    reason="removed by panel owner",
+                    worker_id=getattr(old_ws, "worker_number", None) if old_ws else None,
+                )
+            except Exception:
+                pass
             SESSIONS.pop(self.owner_id, None)
 
         # Always reset panel to fresh state
@@ -297,8 +340,21 @@ def setup_panel(bot: commands.Bot):
             else:
                 # Channel gone — clean stale session so panel goes back to Add Token
                 from selfbot.worker import stop_worker
+                old_ws = session.get("ws")
                 try:
                     await stop_worker(session)
+                except Exception:
+                    pass
+                try:
+                    await log_session_ended(
+                        panel_owner_id=owner_id,
+                        panel_owner_mention=f"<@{owner_id}>",
+                        token_username=session.get("token_username"),
+                        token_user_id=session.get("token_user_id"),
+                        channel_id=session.get("channel_id"),
+                        reason="channel deleted (stale session cleared)",
+                        worker_id=getattr(old_ws, "worker_number", None) if old_ws else None,
+                    )
                 except Exception:
                     pass
                 SESSIONS.pop(owner_id, None)
